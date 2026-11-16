@@ -51,6 +51,8 @@ pub enum OutputKind {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct AudioStats {
     pub real_voices: u32,
+    /// Real voices currently demoted by the soft budget (attenuated, centred).
+    pub demoted_voices: u32,
     pub virtual_voices: u32,
     pub suspended_voices: u32,
     pub started: u64,
@@ -482,6 +484,7 @@ impl AudioRuntime {
         let s = &self.stats;
         AudioStats {
             real_voices: s.real_voices.load(Ordering::Relaxed),
+            demoted_voices: s.demoted_voices.load(Ordering::Relaxed),
             virtual_voices: s.virtual_voices.load(Ordering::Relaxed),
             suspended_voices: s.suspended_voices.load(Ordering::Relaxed),
             started: s.started.load(Ordering::Relaxed),

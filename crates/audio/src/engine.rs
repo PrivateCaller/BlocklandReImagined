@@ -31,6 +31,16 @@ pub struct VoicePolicy {
     pub uncull_delay_ms: u32,
     /// Optional cap on simultaneous instances of the same sound (not vanilla).
     pub max_instances_per_sound: Option<usize>,
+    /// Hard cap on voices mixed at once (not vanilla). Voices ranked past the
+    /// full-mix budget (`max_real_voices`) but within this cap are demoted —
+    /// attenuated per rank over the budget and panned centred — instead of
+    /// being culled; past this cap the vanilla eviction rules still apply.
+    /// Equal to `max_real_voices` (the default) reproduces vanilla's hard 16.
+    pub max_mixed_voices: usize,
+    /// Per-rank gain multiplier for voices over the full-mix budget: the
+    /// `r`-th voice past the budget mixes at `factor^r` (0.708 ≈ −3 dB;
+    /// 1.0 disables demotion).
+    pub demotion_gain_per_rank: f32,
 }
 
 impl Default for VoicePolicy {
@@ -42,6 +52,11 @@ impl Default for VoicePolicy {
             uncull_gain: 0.1,
             uncull_delay_ms: 500,
             max_instances_per_sound: None,
+            // Vanilla behaviour: the full-mix budget is also the hard cap, so
+            // nothing is ever demoted. Dense-scene mixes opt in, e.g.
+            // `max_mixed_voices = 48` with `demotion_gain_per_rank = 0.708`.
+            max_mixed_voices: 16,
+            demotion_gain_per_rank: 0.708,
         }
     }
 }
@@ -75,6 +90,8 @@ impl Default for EngineConfig {
 #[derive(Debug, Default)]
 pub struct SharedStats {
     pub real_voices: AtomicU32,
+    /// Real voices currently demoted by the soft budget (attenuated, centred).
+    pub demoted_voices: AtomicU32,
     pub virtual_voices: AtomicU32,
     pub suspended_voices: AtomicU32,
     pub started: AtomicU64,
@@ -126,6 +143,9 @@ struct Voice {
     last: [f32; 2],
     target: [f32; 2],
     score: f32,
+    /// Soft-budget mix factor (1.0 = full mix; recomputed per block by
+    /// `refresh_demotion`). Below 1.0 the voice also pans centred.
+    demotion: f32,
     culled_at: u64,
     /// Remaining/total frames of a stop fade.
     stop: Option<(u32, u32)>,
@@ -220,8 +240,15 @@ impl Engine {
         channel_gain: [f32; 9],
         music_enabled: bool,
     ) -> Self {
+        let mut cfg = cfg;
+        cfg.voices.max_mixed_voices = cfg.voices.max_mixed_voices.max(cfg.voices.max_real_voices);
+        cfg.voices.demotion_gain_per_rank = if cfg.voices.demotion_gain_per_rank.is_finite() {
+            cfg.voices.demotion_gain_per_rank.clamped(0.0, 1.0)
+        } else {
+            1.0
+        };
         let sample_rate = cfg.sample_rate.max(1);
-        let capacity = cfg.voices.max_real_voices + cfg.voices.max_virtual_voices;
+        let capacity = cfg.voices.max_mixed_voices + cfg.voices.max_virtual_voices;
         let declick_frames = ((cfg.declick_ms.max(0.0) / 1000.0) * sample_rate as f32) as u32;
         Self {
             step_scale: 1.0 / f64::from(sample_rate),
@@ -308,6 +335,7 @@ impl Engine {
             self.stats.commands.fetch_add(applied, Ordering::Relaxed);
         }
 
+        self.refresh_demotion();
         for i in 0..self.voices.len() {
             self.update_targets(i);
         }
@@ -402,19 +430,50 @@ impl Engine {
     }
 
     fn publish_counts(&self) {
-        let (mut real, mut virt, mut susp) = (0u32, 0u32, 0u32);
+        let (mut real, mut virt, mut susp, mut demoted) = (0u32, 0u32, 0u32, 0u32);
         for v in &self.voices {
             if v.suspended {
                 susp += 1;
             } else if v.real {
                 real += 1;
+                if v.demotion < 1.0 {
+                    demoted += 1;
+                }
             } else {
                 virt += 1;
             }
         }
         self.stats.real_voices.store(real, Ordering::Relaxed);
+        self.stats.demoted_voices.store(demoted, Ordering::Relaxed);
         self.stats.virtual_voices.store(virt, Ordering::Relaxed);
         self.stats.suspended_voices.store(susp, Ordering::Relaxed);
+    }
+
+    /// Soft voice budget: rank the real voices by last block's score. The
+    /// loudest `max_real_voices` keep their authored gain; each quieter voice
+    /// over the budget mixes at `demotion_gain_per_rank^ranks-over` with a
+    /// centred pan (see `gains`), so a dense scene fades up to
+    /// `max_mixed_voices` instead of hard-culling past the vanilla 16.
+    /// Scores stay undemoted: eviction ranking and hysteresis are unaffected.
+    fn refresh_demotion(&mut self) {
+        for v in &mut self.voices {
+            v.demotion = 1.0;
+        }
+        let mut order: Vec<(usize, f32)> = self
+            .voices
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.real && !v.suspended && v.done.is_none())
+            .map(|(i, v)| (i, v.score))
+            .collect();
+        order.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let budget = self.cfg.voices.max_real_voices;
+        let factor = self.cfg.voices.demotion_gain_per_rank;
+        for (rank, (i, _)) in order.iter().enumerate() {
+            if rank >= budget {
+                self.voices[*i].demotion = factor.powi((rank - budget + 1) as i32);
+            }
+        }
     }
 
     /// (score, [left, right]) for a voice at its current placement.
@@ -424,6 +483,7 @@ impl Engine {
         position: Option<Vec3>,
         gain_scale: f32,
         hearing: crate::spatial::Hearing,
+        demotion: f32,
     ) -> (f32, [f32; 2]) {
         let pb = &asset.playback;
         let channel = self
@@ -445,12 +505,21 @@ impl Engine {
         let (att, pan) = match (pb.spatial, position) {
             (Some(sp), Some(pos)) => {
                 let (ear, d) = crate::spatial::heard(&self.listener, &self.windows, pos);
-                (attenuation(&hearing.apply(sp), d), pan_gains(ear, pos))
+                // Demoted voices keep their distance attenuation but drop
+                // their direction: the excess over the soft budget folds into
+                // a centred bed instead of cluttering the stereo field, where
+                // a player could not localize it anyway.
+                let pan = if demotion >= 1.0 {
+                    pan_gains(ear, pos)
+                } else {
+                    (SQRT_HALF, SQRT_HALF)
+                };
+                (attenuation(&hearing.apply(sp), d), pan)
             }
             _ => (1.0, (SQRT_HALF, SQRT_HALF)),
         };
         let score = base * att;
-        let amp = self.cfg.gain_curve.apply(score * self.master);
+        let amp = self.cfg.gain_curve.apply(score * self.master) * demotion;
         let g = if mono {
             [amp * pan.0, amp * pan.1]
         } else {
@@ -462,7 +531,7 @@ impl Engine {
     fn update_targets(&mut self, i: usize) {
         let (score, g) = {
             let v = &self.voices[i];
-            self.gains(&v.asset, v.position, v.gain_scale, v.hearing)
+            self.gains(&v.asset, v.position, v.gain_scale, v.hearing, v.demotion)
         };
         let v = &mut self.voices[i];
         v.score = score;
@@ -549,7 +618,7 @@ impl Engine {
                 continue;
             }
             let score = v.score;
-            if self.real_count() >= policy.max_real_voices {
+            if self.real_count() >= policy.max_mixed_voices {
                 match self.quietest_real_below(score) {
                     Some(j) => self.cull_real(j),
                     None => continue,
@@ -784,8 +853,13 @@ impl Engine {
             }
         }
 
-        let (score, target) =
-            self.gains(&asset, position, gain_scale, crate::spatial::Hearing::CLEAR);
+        let (score, target) = self.gains(
+            &asset,
+            position,
+            gain_scale,
+            crate::spatial::Hearing::CLEAR,
+            1.0,
+        );
         let suspended = is_music && !self.music_enabled;
         if suspended && !looping {
             return self.reject(handle, CullReason::MusicDisabled);
@@ -798,7 +872,7 @@ impl Engine {
 
         let mut real = false;
         if !suspended {
-            if self.real_count() < policy.max_real_voices {
+            if self.real_count() < policy.max_mixed_voices {
                 real = true;
             } else if let Some(j) = self.quietest_real_below(score) {
                 self.cull_real(j);
@@ -854,6 +928,7 @@ impl Engine {
             last: target,
             target,
             score,
+            demotion: 1.0,
             culled_at: now,
             stop: None,
             envelope,

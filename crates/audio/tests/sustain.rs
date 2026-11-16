@@ -105,6 +105,9 @@ fn inaudible_virtual_hold_still_releases() {
     let mut cfg = RuntimeConfig::default();
     cfg.engine.sample_rate = OUT_RATE;
     cfg.engine.voices.max_real_voices = 0;
+    // max_real_voices is the full-mix budget; the hard cap that forces
+    // everything virtual is now max_mixed_voices. Pin both for no slots at all.
+    cfg.engine.voices.max_mixed_voices = 0;
     let mut rt = AudioRuntime::new(bank(), cfg, OutputKind::Offline).unwrap();
     let handle = rt
         .play_asset(asset(), Placement::World([1000., 0., 0.]), 1.)
